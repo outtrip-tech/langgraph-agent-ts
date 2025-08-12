@@ -29,7 +29,7 @@ class GmailTool {
     try {
       const response = await this.gmail.users.messages.list({
         userId: "me",
-        q: "is:unread",
+        q: "is:unread in:inbox -category:promotions -category:social -category:updates -category:spam",
         maxResults,
       });
 
@@ -37,14 +37,14 @@ class GmailTool {
         return [];
       }
 
-      const emails: EmailData[] = [];
-
-      for (const message of response.data.messages) {
+      // Parallel fetching of email details
+      const emailPromises = response.data.messages.map(async (message: any) => {
         try {
           const emailDetail = await this.gmail.users.messages.get({
             userId: "me",
             id: message.id,
             format: "full",
+            fields: "id,threadId,payload(headers,body,parts)", // Only request needed fields
           });
 
           const headers = emailDetail.data.payload.headers;
@@ -69,17 +69,17 @@ class GmailTool {
           let isHtml = false;
 
           // Extraer el cuerpo del email
-          if (emailDetail.data.payload.body.data) {
+          if (emailDetail.data.payload.body?.data) {
             body = Buffer.from(
               emailDetail.data.payload.body.data,
               "base64"
             ).toString();
           } else if (emailDetail.data.payload.parts) {
             for (const part of emailDetail.data.payload.parts) {
-              if (part.mimeType === "text/plain" && part.body.data) {
+              if (part.mimeType === "text/plain" && part.body?.data) {
                 body = Buffer.from(part.body.data, "base64").toString();
                 break;
-              } else if (part.mimeType === "text/html" && part.body.data) {
+              } else if (part.mimeType === "text/html" && part.body?.data) {
                 body = Buffer.from(part.body.data, "base64").toString();
                 isHtml = true;
                 break;
@@ -92,7 +92,7 @@ class GmailTool {
             body = limpiarTextoEmail(body);
           }
 
-          emails.push({
+          return {
             id: message.id,
             from,
             subject,
@@ -105,16 +105,22 @@ class GmailTool {
             inReplyTo,
             fromEmail,
             replyTo,
-          });
+          };
         } catch (error) {
-          console.error(`Error procesando email ${message.id}:`, error);
-          continue;
+          return null;
         }
-      }
+      });
+
+      // Wait for all email fetches to complete in parallel
+      const emailResults = await Promise.all(emailPromises);
+
+      // Filter out null results (failed fetches)
+      const emails = emailResults.filter(
+        (email): email is EmailData => email !== null
+      );
 
       return emails;
     } catch (error) {
-      console.error("Error obteniendo emails:", error);
       throw new Error("No se pudieron obtener los emails");
     }
   }
@@ -131,7 +137,6 @@ class GmailTool {
 
       return true;
     } catch (error) {
-      console.error("Error marcando email como leído:", error);
       return false;
     }
   }
@@ -141,7 +146,7 @@ class GmailTool {
     etiqueta: "PROCESSED" | "QUOTE" | "NOT_QUOTE"
   ): Promise<boolean> {
     try {
-      // Crear etiqueta si no existe
+      // Intentar crear etiqueta silenciosamente
       await this.crearEtiquetaSiNoExiste(etiqueta);
 
       await this.gmail.users.messages.modify({
@@ -154,7 +159,6 @@ class GmailTool {
 
       return true;
     } catch (error) {
-      console.error("Error etiquetando email:", error);
       return false;
     }
   }
@@ -176,9 +180,7 @@ class GmailTool {
           },
         });
       }
-    } catch (error) {
-      console.error("Error creando etiqueta:", error);
-    }
+    } catch (error) {}
   }
 }
 
@@ -191,17 +193,18 @@ export function initializeGmailTools(config: ConfigGmail) {
 
 // Tool to read unread emails
 export const readEmailsTool = tool(
-  async ({ maxResults }: { maxResults: number }): Promise<{ 
+  async ({
+    maxResults,
+  }: {
+    maxResults: number;
+  }): Promise<{
     emails: EmailData[];
-    unprocessedCount: number; 
+    unprocessedCount: number;
   }> => {
     try {
-      console.log("🔧 Tool: Leyendo emails no leídos...");
-      
       const emails = await gmailToolInstance.obtenerEmailsNoLeidos(maxResults);
-      
+
       if (emails.length === 0) {
-        console.log("✉️ Tool: No se encontraron emails no leídos");
         return { emails: [], unprocessedCount: 0 };
       }
 
@@ -214,15 +217,11 @@ export const readEmailsTool = tool(
         }
       }
 
-      console.log(`📩 Tool: ${unprocessedEmails.length} emails sin procesar de ${emails.length} total`);
-      
-      return { 
+      return {
         emails: unprocessedEmails,
-        unprocessedCount: unprocessedEmails.length 
+        unprocessedCount: unprocessedEmails.length,
       };
-
     } catch (error) {
-      console.error("❌ Tool: Error leyendo emails:", error);
       return { emails: [], unprocessedCount: 0 };
     }
   },
@@ -230,7 +229,12 @@ export const readEmailsTool = tool(
     name: "read_emails",
     description: "Lee emails no leídos de Gmail y filtra los ya procesados",
     schema: z.object({
-      maxResults: z.number().min(1).max(50).default(5).describe("Número máximo de emails a leer"),
+      maxResults: z
+        .number()
+        .min(1)
+        .max(50)
+        .default(5)
+        .describe("Número máximo de emails a leer"),
     }),
   }
 );
@@ -239,20 +243,10 @@ export const readEmailsTool = tool(
 export const markAsReadTool = tool(
   async ({ emailId }: { emailId: string }): Promise<{ success: boolean }> => {
     try {
-      console.log(`🔧 Tool: Marcando email ${emailId} como leído...`);
-      
       const success = await gmailToolInstance.marcarComoLeido(emailId);
-      
-      if (success) {
-        console.log("✅ Tool: Email marcado como leído");
-      } else {
-        console.log("❌ Tool: Error marcando email como leído");
-      }
-      
-      return { success };
 
+      return { success };
     } catch (error) {
-      console.error("❌ Tool: Error marcando email como leído:", error);
       return { success: false };
     }
   },
@@ -267,28 +261,18 @@ export const markAsReadTool = tool(
 
 // Tool to label email
 export const labelEmailTool = tool(
-  async ({ 
-    emailId, 
-    label 
-  }: { 
-    emailId: string; 
-    label: "PROCESSED" | "QUOTE" | "NOT_QUOTE" 
+  async ({
+    emailId,
+    label,
+  }: {
+    emailId: string;
+    label: "PROCESSED" | "QUOTE" | "NOT_QUOTE";
   }): Promise<{ success: boolean }> => {
     try {
-      console.log(`🔧 Tool: Etiquetando email ${emailId} con ${label}...`);
-      
       const success = await gmailToolInstance.etiquetarEmail(emailId, label);
-      
-      if (success) {
-        console.log(`✅ Tool: Email etiquetado como ${label}`);
-      } else {
-        console.log(`❌ Tool: Error etiquetando email como ${label}`);
-      }
-      
-      return { success };
 
+      return { success };
     } catch (error) {
-      console.error("❌ Tool: Error etiquetando email:", error);
       return { success: false };
     }
   },
@@ -297,7 +281,9 @@ export const labelEmailTool = tool(
     description: "Agrega una etiqueta a un email en Gmail",
     schema: z.object({
       emailId: z.string().describe("ID del email a etiquetar"),
-      label: z.enum(["PROCESSED", "QUOTE", "NOT_QUOTE"]).describe("Etiqueta a aplicar"),
+      label: z
+        .enum(["PROCESSED", "QUOTE", "NOT_QUOTE"])
+        .describe("Etiqueta a aplicar"),
     }),
   }
 );
@@ -310,16 +296,10 @@ export const getStatsTool = tool(
     todayQuotations: number;
   }> => {
     try {
-      console.log("🔧 Tool: Obteniendo estadísticas...");
-      
       const stats = await SimpleDataManager.getStatistics();
-      
-      console.log(`📊 Tool: ${stats.totalQuotations} cotizaciones, ${stats.uniqueClients} clientes únicos`);
-      
-      return stats;
 
+      return stats;
     } catch (error) {
-      console.error("❌ Tool: Error obteniendo estadísticas:", error);
       return { totalQuotations: 0, uniqueClients: 0, todayQuotations: 0 };
     }
   },

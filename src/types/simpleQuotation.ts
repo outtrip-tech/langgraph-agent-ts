@@ -51,4 +51,5 @@ export interface ClassificationResult {
   is_quote: boolean;
   signals: string[];
   confidence: number;
+  quote_type?: "B2B" | "B2C" | "unclear" | null;
 }

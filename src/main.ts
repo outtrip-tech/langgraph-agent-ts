@@ -6,8 +6,6 @@ dotenv.config();
 
 async function main() {
   try {
-    console.log("🤖 Iniciando Agente Simple de Cotizaciones...\n");
-
     // Verificar variables de entorno
     const config: ConfigGmail = {
       clientId: process.env.GMAIL_CLIENT_ID!,
@@ -34,36 +32,12 @@ async function main() {
       process.exit(1);
     }
 
-    // Crear y ejecutar el agente
+    // Crear y ejecutar el agente (logging handled internally)
     const agent = new SimpleQuoteAgent(config);
-    const quotations = await agent.processEmails();
-
-    // Mostrar resumen final
-    console.log("\n" + "=".repeat(50));
-    console.log("📄 RESUMEN DE PROCESAMIENTO");
-    console.log("=".repeat(50));
-    
-    if (quotations.length === 0) {
-      console.log("🔍 No se encontraron nuevas solicitudes de cotización");
-    } else {
-      console.log(`✅ ${quotations.length} nueva${quotations.length > 1 ? 's' : ''} cotización${quotations.length > 1 ? 'es' : ''} creada${quotations.length > 1 ? 's' : ''}:`);
-      
-      quotations.forEach((q, index) => {
-        console.log(`\n${index + 1}. ${q.id}`);
-        console.log(`   👤 Cliente: ${q.clientName} (${q.clientEmail})`);
-        console.log(`   📝 Asunto: ${q.subject}`);
-        if (q.destination) console.log(`   🌍 Destino: ${q.destination}`);
-        if (q.dates) console.log(`   📅 Fechas: ${q.dates}`);
-        if (q.travelers) console.log(`   ✈️ Viajeros: ${q.travelers}`);
-        if (q.budget) console.log(`   💰 Presupuesto: ${q.budget}`);
-        if (q.notes) console.log(`   📋 Notas: ${q.notes}`);
-      });
-    }
-
-    console.log("\n✨ Procesamiento completado exitosamente");
+    await agent.processEmails();
 
   } catch (error) {
-    console.error("❌ Error ejecutando agente simple:", error);
+    console.error("❌ Error ejecutando agente:", error);
     process.exit(1);
   }
 }

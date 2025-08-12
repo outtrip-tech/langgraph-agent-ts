@@ -2,6 +2,7 @@ import { StateGraph, Annotation } from "@langchain/langgraph";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { SimpleDataManager } from "../utils/simpleDataManager.js";
+import { SimpleLogger, EmailProcessingResult } from "../utils/simpleLogger.js";
 import {
   EmailData,
   ConfigGmail,
@@ -12,6 +13,7 @@ import {
 import {
   getClassificationPrompt,
   parseClassificationResponse,
+  classifyEmailMultiLevel,
 } from "../prompts/classification.js";
 import {
   getSimpleExtractionPrompt,
@@ -59,9 +61,9 @@ export class SimpleQuoteAgent {
 
   constructor(config: ConfigGmail) {
     this.model = new ChatOpenAI({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      maxTokens: 2000,
+      model: "gpt-4o-mini-2024-07-18",
+      temperature: 0,
+      maxTokens: 1000,
     });
 
     // Initialize Gmail tools
@@ -112,43 +114,37 @@ export class SimpleQuoteAgent {
   // Node: Read emails
   private async leerEmails(state: any): Promise<any> {
     try {
-      console.log("📧 Nodo: Leyendo emails...");
-
       // If we have emails and haven't finished processing, get next email
-      if (state.emails.length > 0 && state.currentEmailIndex < state.emails.length) {
+      if (
+        state.emails.length > 0 &&
+        state.currentEmailIndex < state.emails.length
+      ) {
         const currentEmail = state.emails[state.currentEmailIndex];
-        console.log(`📋 Procesando email ${state.currentEmailIndex + 1}/${state.emails.length}: ${currentEmail.subject}`);
-        
-        return { 
+
+        return {
           currentEmail,
         };
       }
 
       // First time or need to read new emails
-      console.log("🔍 Obteniendo nuevos emails...");
-      
+
       const result = await readEmailsTool.invoke({ maxResults: 5 });
-      
+
       if (result.emails.length === 0) {
-        console.log("✅ No hay emails para procesar");
-        return { 
+        return {
           emails: [],
           finished: true,
         };
       }
 
-      console.log(`📩 ${result.emails.length} emails encontrados`);
-      
       return {
         emails: result.emails,
         currentEmailIndex: 0,
         currentEmail: result.emails[0],
         finished: false,
       };
-
     } catch (error) {
-      console.error("❌ Error leyendo emails:", error);
-      return { 
+      return {
         error: `Error leyendo emails: ${error}`,
         finished: true,
       };
@@ -162,53 +158,148 @@ export class SimpleQuoteAgent {
         return { error: "No hay email actual para clasificar" };
       }
 
-      console.log(`🔍 Nodo: Clasificando email de ${state.currentEmail.from}`);
-      
-      const { subject, body } = state.currentEmail;
-      const prompt = getClassificationPrompt(subject, body);
+      const { subject, body, fromEmail } = state.currentEmail;
 
-      const response = await this.model.invoke([
-        new SystemMessage("Eres un asistente especializado en identificar consultas de viajes y turismo para una agencia de viajes profesional."),
-        new HumanMessage(prompt),
-      ]);
+      // Prepare logging info
+      const emailIndex = state.currentEmailIndex + 1;
+      const totalEmails = state.emails.length;
 
-      const result: ClassificationResult = parseClassificationResponse(
-        response.content.toString()
+      // First, use multi-level classification engine
+      const multiLevelResult = classifyEmailMultiLevel(
+        subject,
+        body,
+        fromEmail
       );
+
+      let result: ClassificationResult;
+
+      // Decide if LLM validation is needed
+      const needsLLMValidation =
+        (multiLevelResult.finalConfidence >= 40 &&
+          multiLevelResult.finalConfidence <= 80) ||
+        multiLevelResult.quoteType === "unclear";
+
+      if (!needsLLMValidation) {
+        // High confidence from multi-level analysis - skip LLM
+        result = {
+          is_quote: multiLevelResult.isQuoteRequest,
+          confidence: multiLevelResult.finalConfidence,
+          signals: multiLevelResult.allSignals,
+          quote_type:
+            multiLevelResult.quoteType === "unclear"
+              ? null
+              : multiLevelResult.quoteType,
+        };
+      } else {
+        // Medium confidence - use LLM for validation
+
+        const prompt = getClassificationPrompt(subject, body);
+
+        const response = await this.model.invoke([
+          new SystemMessage(
+            "Eres un asistente especializado en identificar consultas de viajes y turismo para una agencia de viajes profesional."
+          ),
+          new HumanMessage(prompt),
+        ]);
+
+        result = parseClassificationResponse(response.content.toString());
+
+        // Cross-validation between multi-level and LLM results
+        if (
+          multiLevelResult.isQuoteRequest &&
+          !result.is_quote &&
+          multiLevelResult.finalConfidence >= 60
+        ) {
+          console.log(
+            `⚠️  Discrepancia: Multi-nivel dice SÍ, LLM dice NO - usando multi-nivel`
+          );
+          result.is_quote = true;
+          result.confidence = Math.max(
+            result.confidence,
+            multiLevelResult.finalConfidence
+          );
+        } else if (
+          !multiLevelResult.isQuoteRequest &&
+          result.is_quote &&
+          result.confidence < 70
+        ) {
+          console.log(
+            `⚠️  Discrepancia: Multi-nivel dice NO, LLM dice SÍ con baja confianza - usando multi-nivel`
+          );
+          result.is_quote = false;
+          result.confidence = multiLevelResult.finalConfidence;
+        }
+
+        // Enhance with multi-level signals
+        result.signals = [
+          ...new Set([...result.signals, ...multiLevelResult.allSignals]),
+        ];
+        result.quote_type = result.quote_type || multiLevelResult.quoteType;
+      }
+
+      // Early exit for very low confidence
+      if (result.confidence < 30) {
+        labelEmailTool
+          .invoke({
+            emailId: state.currentEmail.id,
+            label: "NOT_QUOTE",
+          })
+          .catch(() => {
+            // Silenciar errores de etiquetado
+          });
+
+        // Log processing result
+        SimpleLogger.logEmailProcessing({
+          index: emailIndex,
+          total: totalEmails,
+          from: state.currentEmail.from,
+          subject: subject,
+          result: "NO COTIZACIÓN",
+          error: `Confianza muy baja (${result.confidence}%)`,
+        });
+
+        return { esCotizacion: false };
+      }
 
       const isQuote = result.is_quote && result.confidence >= 70;
 
-      console.log(
-        `📊 Resultado: ${
-          isQuote ? "ES COTIZACIÓN" : "NO ES COTIZACIÓN"
-        } (${result.confidence}%)`
-      );
+      // Determine result type for logging
+      let resultType: EmailProcessingResult["result"] = "NO COTIZACIÓN";
+      if (isQuote) {
+        resultType =
+          result.quote_type === "B2B" ? "COTIZACIÓN B2B" : "COTIZACIÓN B2C";
+      }
 
       // Label the email based on classification
-      await labelEmailTool.invoke({ 
-        emailId: state.currentEmail.id, 
-        label: isQuote ? "QUOTE" : "NOT_QUOTE" 
-      });
+      labelEmailTool
+        .invoke({
+          emailId: state.currentEmail.id,
+          label: isQuote ? "QUOTE" : "NOT_QUOTE",
+        })
+        .catch(() => {
+          // Silenciar errores de etiquetado
+        });
 
-      return { esCotizacion: isQuote };
-
+      // Store result for later logging (will be completed when quotation is created or processing finishes)
+      return {
+        esCotizacion: isQuote,
+        classificationResult: result,
+        loggingInfo: { emailIndex, totalEmails, resultType },
+      };
     } catch (error) {
-      console.error("❌ Error clasificando email:", error);
-      return { 
+      return {
         error: `Error clasificando email: ${error}`,
         esCotizacion: false,
       };
     }
   }
 
-  // Node: Extract data 
+  // Node: Extract data
   private async extraerDatos(state: any): Promise<any> {
     try {
       if (!state.currentEmail) {
         return { error: "No hay email para extraer datos" };
       }
-
-      console.log("🔬 Nodo: Extrayendo datos básicos...");
 
       const { subject, body, from, fromEmail } = state.currentEmail;
       const fromName = from.includes("<")
@@ -216,7 +307,12 @@ export class SimpleQuoteAgent {
         : from;
       const cleanFromEmail = fromEmail || from;
 
-      const prompt = getSimpleExtractionPrompt(subject, body, cleanFromEmail, fromName);
+      const prompt = getSimpleExtractionPrompt(
+        subject,
+        body,
+        cleanFromEmail,
+        fromName
+      );
 
       const response = await this.model.invoke([
         new SystemMessage(
@@ -225,25 +321,25 @@ export class SimpleQuoteAgent {
         new HumanMessage(prompt),
       ]);
 
-      const extractionResult: SimpleExtractionResult = parseSimpleExtractionResponse(
-        response.content.toString()
-      );
+      const extractionResult: SimpleExtractionResult =
+        parseSimpleExtractionResponse(response.content.toString());
 
-      console.log(`🎯 Datos extraídos con confianza: ${extractionResult.confidence}%`);
-      
-      if (extractionResult.confidence < 30) {
-        console.log("⚠️ Confianza muy baja en extracción");
-        return { 
+      // Early validation - skip if very low confidence or no useful data
+      if (
+        extractionResult.confidence < 30 ||
+        (!extractionResult.destination &&
+          !extractionResult.dates &&
+          !extractionResult.travelers)
+      ) {
+        return {
           extractionResult,
-          error: "Confianza muy baja en extracción de datos",
+          error: "Datos insuficientes para crear cotización",
         };
       }
 
       return { extractionResult };
-
     } catch (error) {
-      console.error("❌ Error extrayendo datos:", error);
-      return { 
+      return {
         error: `Error extrayendo datos: ${error}`,
         extractionResult: { confidence: 0 },
       };
@@ -257,13 +353,15 @@ export class SimpleQuoteAgent {
         return { error: "Faltan datos para crear cotización" };
       }
 
-      console.log("💾 Nodo: Creando cotización simple...");
-
+      // Silent quotation creation
       const { currentEmail, extractionResult } = state;
 
       // Extract clean email from "from" field
-      const fromEmail = currentEmail.fromEmail || 
-        (currentEmail.from.includes("<") ? currentEmail.from.match(/<([^>]+)>/)?.[1] : currentEmail.from) ||
+      const fromEmail =
+        currentEmail.fromEmail ||
+        (currentEmail.from.includes("<")
+          ? currentEmail.from.match(/<([^>]+)>/)?.[1]
+          : currentEmail.from) ||
         currentEmail.from;
 
       // Create quotation
@@ -275,22 +373,16 @@ export class SimpleQuoteAgent {
         dates: extractionResult.dates || "",
         travelers: extractionResult.travelers || "",
         budget: extractionResult.budget || "",
-        notes: extractionResult.notes || `Email original de: ${currentEmail.from}`,
+        notes:
+          extractionResult.notes || `Email original de: ${currentEmail.from}`,
         emailId: currentEmail.id,
       });
 
-      console.log(`✅ Cotización creada: ${quotation.id}`);
-      console.log(`👤 Cliente: ${quotation.clientName} (${quotation.clientEmail})`);
-      if (quotation.destination) console.log(`🌍 Destino: ${quotation.destination}`);
-      if (quotation.dates) console.log(`📅 Fechas: ${quotation.dates}`);
-      if (quotation.travelers) console.log(`✈️ Viajeros: ${quotation.travelers}`);
-      if (quotation.budget) console.log(`💰 Presupuesto: ${quotation.budget}`);
+      // Silent quotation creation - logging handled in procesarEmail
 
       return { quotation };
-
     } catch (error) {
-      console.error("❌ Error creando cotización:", error);
-      return { 
+      return {
         error: `Error creando cotización: ${error}`,
       };
     }
@@ -303,31 +395,47 @@ export class SimpleQuoteAgent {
         return { error: "No hay email para procesar" };
       }
 
-      console.log("✅ Nodo: Procesando email...");
-      
-      const { currentEmail } = state;
+      const { currentEmail, loggingInfo } = state;
 
-      // Mark as read
-      await markAsReadTool.invoke({ emailId: currentEmail.id });
-      
-      // Label as processed
-      await labelEmailTool.invoke({ 
-        emailId: currentEmail.id, 
-        label: "PROCESSED" 
-      });
-      
-      console.log("🏷️ Email marcado como procesado");
+      // Batch Gmail operations for better performance
+      try {
+        await Promise.all([
+          markAsReadTool.invoke({ emailId: currentEmail.id }),
+          labelEmailTool
+            .invoke({
+              emailId: currentEmail.id,
+              label: "PROCESSED",
+            })
+            .catch(() => {
+              // Silenciar errores de etiquetado - no son críticos
+            }),
+        ]);
+      } catch (error) {
+        // Solo marcar como leído si falla el etiquetado
+        try {
+          await markAsReadTool.invoke({ emailId: currentEmail.id });
+        } catch (markError) {}
+      }
+
+      if (loggingInfo) {
+        SimpleLogger.logEmailProcessing({
+          index: loggingInfo.emailIndex,
+          total: loggingInfo.totalEmails,
+          from: currentEmail.from,
+          subject: currentEmail.subject,
+          result: loggingInfo.resultType,
+          quoteId: state.quotation?.id,
+        });
+      }
 
       // Add quotation to processed list if created
       const newProcessedQuotations = state.quotation ? [state.quotation] : [];
-      
+
       // Move to next email
       const nextIndex = state.currentEmailIndex + 1;
       const hasMoreEmails = nextIndex < state.emails.length;
 
-      console.log("✨ Email procesado exitosamente");
-
-      return { 
+      return {
         currentEmailIndex: nextIndex,
         processedQuotations: newProcessedQuotations,
         currentEmail: undefined, // Clear current email
@@ -335,11 +443,11 @@ export class SimpleQuoteAgent {
         extractionResult: undefined, // Clear extraction result
         esCotizacion: false, // Reset flag
         finished: !hasMoreEmails,
+        error: undefined, // Clear any previous errors
       };
-
     } catch (error) {
       console.error("❌ Error procesando email:", error);
-      return { 
+      return {
         error: `Error procesando email: ${error}`,
         finished: true,
       };
@@ -347,21 +455,13 @@ export class SimpleQuoteAgent {
   }
 
   // Node: Finalize
-  private async finalizar(state: any): Promise<any> {
-    console.log("🏁 Nodo: Finalizando procesamiento...");
-    
-    if (state.error) {
-      console.log("❌ Proceso terminó con errores:", state.error);
-    } else {
-      const quotationsCount = state.processedQuotations?.length || 0;
-      console.log(`🎉 Procesamiento completado. ${quotationsCount} nuevas cotizaciones creadas`);
-    }
-
+  private async finalizar(_state: any): Promise<any> {
     return { finished: true };
   }
 
-  // Routing functions
+  // Routing functions (optimized for smart routing)
   private decidirDespuesLeerEmails(state: any): string {
+    // Fast path for completion
     if (state.finished || state.error || !state.currentEmail) {
       return "finalizar";
     }
@@ -369,16 +469,21 @@ export class SimpleQuoteAgent {
   }
 
   private decidirDespuesClasificar(state: any): string {
+    // Smart routing - avoid unnecessary processing
     if (state.error) {
-      return "procesar"; // Process even with error to mark as read
+      return "procesar"; // Process with error to mark as read
     }
-    if (state.esCotizacion) {
-      return "extraer";
+
+    // Early exit for non-quotes
+    if (!state.esCotizacion) {
+      return "procesar"; // Skip extraction, go straight to processing
     }
-    return "procesar"; // Not a quote, just process (mark as read)
+
+    return "extraer";
   }
 
   private decidirDespuesProcesar(state: any): string {
+    // Early termination conditions
     if (state.finished || state.error) {
       return "finalizar";
     }
@@ -388,13 +493,8 @@ export class SimpleQuoteAgent {
   // Main processing method - maintains same API as before
   async processEmails(): Promise<SimpleQuotation[]> {
     try {
-      console.log("🚀 Iniciando procesamiento con StateGraph...");
-
-      // Show current statistics
-      const stats = await getStatsTool.invoke({});
-      console.log(
-        `📊 Estadísticas actuales: ${stats.totalQuotations} cotizaciones, ${stats.uniqueClients} clientes únicos`
-      );
+      // Initialize clean logging
+      SimpleLogger.startSession();
 
       // Initialize state
       const initialState = {
@@ -404,21 +504,44 @@ export class SimpleQuoteAgent {
         finished: false,
       };
 
+      const startTime = Date.now();
+
       // Run the graph
       const result = await this.graph.invoke(initialState);
 
       const processedQuotations = result.processedQuotations || [];
-      
-      console.log(`\n🎉 Procesamiento completado. ${processedQuotations.length} nuevas cotizaciones creadas`);
-      
-      if (result.error) {
-        console.log(`⚠️ Proceso terminó con errores: ${result.error}`);
-      }
+      const processingTimeMs = Date.now() - startTime;
+
+      // Get statistics for summary
+      await getStatsTool.invoke({});
+
+      // Calculate summary data
+      const emailsProcessed = result.emails?.length || 0;
+      const quotationsCreated = processedQuotations.length;
+      const notQuotations = emailsProcessed - quotationsCreated;
+
+      // Prepare quotations for summary
+      const quotationsSummary = processedQuotations.map(
+        (q: SimpleQuotation) => ({
+          id: q.id,
+          clientName: q.clientName,
+          subject: q.subject,
+          type: "B2C" as "B2B" | "B2C", // Default for now, could be enhanced
+        })
+      );
+
+      // Display clean summary
+      SimpleLogger.logProcessingSummary({
+        emailsProcessed,
+        quotationsCreated,
+        notQuotations,
+        processingTimeMs,
+        quotations: quotationsSummary,
+      });
 
       return processedQuotations;
-
     } catch (error) {
-      console.error("❌ Error en procesamiento principal:", error);
+      SimpleLogger.logError("Error en procesamiento principal", error as Error);
       throw error;
     }
   }
