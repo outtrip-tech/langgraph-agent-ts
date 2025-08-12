@@ -25,6 +25,17 @@ class GmailTool {
     this.gmail = google.gmail({ version: "v1", auth: this.oauth2Client });
   }
 
+  // Encode subject for proper UTF-8 support with tildes and special characters
+  private encodeSubject(subject: string): string {
+    // Check if subject contains non-ASCII characters
+    if (/[^\x00-\x7F]/.test(subject)) {
+      // Use RFC 2047 encoding for non-ASCII characters
+      const encoded = Buffer.from(subject, 'utf8').toString('base64');
+      return `=?UTF-8?B?${encoded}?=`;
+    }
+    return subject;
+  }
+
   async obtenerEmailsNoLeidos(maxResults: number = 10): Promise<EmailData[]> {
     try {
       const response = await this.gmail.users.messages.list({
@@ -182,6 +193,108 @@ class GmailTool {
       }
     } catch (error) {}
   }
+
+  async enviarRespuesta(
+    emailOriginal: EmailData,
+    cuerpo: string,
+    esHtml: boolean = false
+  ): Promise<boolean> {
+    try {
+      // Encode subject with UTF-8 support for special characters
+      const encodedSubject = this.encodeSubject(`Re: ${emailOriginal.subject}`);
+      
+      // Extract clean email address
+      const toEmail = emailOriginal.fromEmail || 
+                     emailOriginal.replyTo || 
+                     (emailOriginal.from.includes('<') 
+                       ? emailOriginal.from.match(/<([^>]+)>/)?.[1] 
+                       : emailOriginal.from);
+
+      // Build proper references chain for threading
+      let referencesHeader = '';
+      if (emailOriginal.references && emailOriginal.messageId) {
+        referencesHeader = `${emailOriginal.references} ${emailOriginal.messageId}`;
+      } else if (emailOriginal.messageId) {
+        referencesHeader = emailOriginal.messageId;
+      }
+
+      // Construct headers for proper email threading
+      const headers = [
+        `To: ${toEmail}`,
+        `Subject: ${encodedSubject}`,
+        `In-Reply-To: ${emailOriginal.messageId || ''}`,
+        ...(referencesHeader ? [`References: ${referencesHeader}`] : []),
+        `Content-Type: ${esHtml ? 'text/html' : 'text/plain'}; charset=utf-8`,
+        `Content-Transfer-Encoding: 8bit`,
+      ].filter(header => !header.endsWith(': ')); // Remove empty headers
+
+      const email = [
+        ...headers,
+        '',
+        cuerpo
+      ].join('\r\n');
+
+      const encodedEmail = Buffer.from(email, 'utf8')
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      await this.gmail.users.messages.send({
+        userId: "me",
+        requestBody: {
+          raw: encodedEmail,
+          threadId: emailOriginal.threadId,
+        },
+      });
+
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async enviarEmail(
+    destinatario: string,
+    asunto: string,
+    cuerpo: string,
+    esHtml: boolean = false
+  ): Promise<boolean> {
+    try {
+      // Encode subject with UTF-8 support for special characters
+      const encodedSubject = this.encodeSubject(asunto);
+      
+      const headers = [
+        `To: ${destinatario}`,
+        `Subject: ${encodedSubject}`,
+        `Content-Type: ${esHtml ? 'text/html' : 'text/plain'}; charset=utf-8`,
+        `Content-Transfer-Encoding: 8bit`,
+      ];
+
+      const email = [
+        ...headers,
+        '',
+        cuerpo
+      ].join('\r\n');
+
+      const encodedEmail = Buffer.from(email, 'utf8')
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      await this.gmail.users.messages.send({
+        userId: "me",
+        requestBody: {
+          raw: encodedEmail,
+        },
+      });
+
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
 }
 
 // Gmail Tool instance (to be injected)
@@ -284,6 +397,91 @@ export const labelEmailTool = tool(
       label: z
         .enum(["PROCESSED", "QUOTE", "NOT_QUOTE"])
         .describe("Etiqueta a aplicar"),
+    }),
+  }
+);
+
+// Tool to send reply email
+export const sendReplyEmailTool = tool(
+  async ({
+    emailOriginal,
+    cuerpo,
+    esHtml = false,
+  }: {
+    emailOriginal: EmailData;
+    cuerpo: string;
+    esHtml?: boolean;
+  }): Promise<{ success: boolean }> => {
+    try {
+      const success = await gmailToolInstance.enviarRespuesta(
+        emailOriginal,
+        cuerpo,
+        esHtml
+      );
+
+      return { success };
+    } catch (error) {
+      return { success: false };
+    }
+  },
+  {
+    name: "send_reply_email",
+    description: "Envía una respuesta a un email específico manteniendo el hilo de conversación",
+    schema: z.object({
+      emailOriginal: z.object({
+        id: z.string(),
+        from: z.string(),
+        subject: z.string(),
+        body: z.string(),
+        date: z.string(),
+        isHtml: z.boolean(),
+        threadId: z.string().optional(),
+        messageId: z.string().optional(),
+        references: z.string().optional(),
+        inReplyTo: z.string().optional(),
+        fromEmail: z.string().optional(),
+        replyTo: z.string().optional(),
+      }),
+      cuerpo: z.string().describe("Contenido del email de respuesta"),
+      esHtml: z.boolean().optional().default(false).describe("Si el contenido es HTML"),
+    }),
+  }
+);
+
+// Tool to send notification email
+export const sendNotificationEmailTool = tool(
+  async ({
+    destinatario,
+    asunto,
+    cuerpo,
+    esHtml = false,
+  }: {
+    destinatario: string;
+    asunto: string;
+    cuerpo: string;
+    esHtml?: boolean;
+  }): Promise<{ success: boolean }> => {
+    try {
+      const success = await gmailToolInstance.enviarEmail(
+        destinatario,
+        asunto,
+        cuerpo,
+        esHtml
+      );
+
+      return { success };
+    } catch (error) {
+      return { success: false };
+    }
+  },
+  {
+    name: "send_notification_email",
+    description: "Envía un email de notificación a un destinatario",
+    schema: z.object({
+      destinatario: z.string().describe("Dirección de email del destinatario"),
+      asunto: z.string().describe("Asunto del email"),
+      cuerpo: z.string().describe("Contenido del email"),
+      esHtml: z.boolean().optional().default(false).describe("Si el contenido es HTML"),
     }),
   }
 );

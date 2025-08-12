@@ -7,10 +7,11 @@ const SIMPLE_QUOTATIONS_FILE = path.join(
   "simple_quotations.json"
 );
 
-// In-memory cache for better performance
+// Optimized in-memory cache for better performance
 let quotationsCache: SimpleQuotation[] | null = null;
 let cacheTimestamp = 0;
-const CACHE_TTL = 30 * 1000; // 30 seconds
+let emailProcessedCache = new Set<string>();
+const CACHE_TTL = 60 * 1000; // 60 seconds for better performance
 
 export class SimpleDataManager {
   // Load all quotations with caching
@@ -41,6 +42,10 @@ export class SimpleDataManager {
     // Update cache immediately for better performance
     quotationsCache = quotations;
     cacheTimestamp = Date.now();
+    
+    // Update email processed cache
+    emailProcessedCache.clear();
+    quotations.forEach(q => emailProcessedCache.add(q.emailId));
 
     // Async write to disk (non-blocking)
     const dataString = JSON.stringify(quotations, null, 2);
@@ -56,14 +61,14 @@ export class SimpleDataManager {
 
   // Create a new quotation
   static async createQuotation(
-    quotationData: Omit<SimpleQuotation, "id" | "createdAt">
+    quotationData: Omit<SimpleQuotation, "id">
   ): Promise<SimpleQuotation> {
     const quotations = await this.loadQuotations();
 
     const newQuotation: SimpleQuotation = {
       ...quotationData,
       id: await this.generateQuotationId(),
-      createdAt: new Date(),
+      // createdAt is now provided in quotationData as ISO string
     };
 
     quotations.push(newQuotation);
@@ -81,11 +86,20 @@ export class SimpleDataManager {
     return quotations.filter((q) => q.clientEmail.toLowerCase() === lowerEmail);
   }
 
-  // Check if an email was already processed (optimized early exit)
+  // Check if an email was already processed (optimized with cache)
   static async isEmailProcessed(emailId: string): Promise<boolean> {
+    // Check cache first if available
+    if (emailProcessedCache.size > 0) {
+      return emailProcessedCache.has(emailId);
+    }
+    
+    // Fallback to loading quotations
     const quotations = await this.loadQuotations();
-    // Use some() for early exit on first match
-    return quotations.some((q) => q.emailId === emailId);
+    // Update cache
+    emailProcessedCache.clear();
+    quotations.forEach(q => emailProcessedCache.add(q.emailId));
+    
+    return emailProcessedCache.has(emailId);
   }
 
   // Get basic statistics

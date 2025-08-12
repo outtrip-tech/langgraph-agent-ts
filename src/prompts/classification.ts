@@ -160,7 +160,7 @@ export function detectB2BPatterns(subject: string, body: string, fromEmail?: str
   };
 }
 
-// Multi-level classification engine
+// Simplified and optimized classification engine
 export function classifyEmailMultiLevel(subject: string, body: string, fromEmail?: string): {
   isTourismRelated: boolean;
   isCommercialInquiry: boolean;
@@ -170,89 +170,42 @@ export function classifyEmailMultiLevel(subject: string, body: string, fromEmail
   reasoning: string[];
   allSignals: string[];
 } {
-  const reasoning: string[] = [];
-  const allSignals: string[] = [];
-  
-  // Level 1: Tourism related?
+  // Fast analysis using pattern matching
   const patternAnalysis = analyzeEmailSignals(subject, body);
-  const isTourismRelated = patternAnalysis.patterns.weakSignals.length > 0 || 
-                          patternAnalysis.patterns.moderateSignals.length > 0 || 
-                          patternAnalysis.patterns.strongSignals.length > 0;
+  const allSignals = patternAnalysis.signals;
   
+  // Early exit for non-tourism related content
+  const isTourismRelated = patternAnalysis.score > 20;
   if (!isTourismRelated) {
-    reasoning.push("No menciona términos relacionados con turismo");
     return {
       isTourismRelated: false,
       isCommercialInquiry: false,
       isQuoteRequest: false,
       quoteType: "unclear",
       finalConfidence: 0,
-      reasoning,
+      reasoning: ["No terms related to tourism"],
       allSignals: []
     };
   }
-  
-  reasoning.push("Contiene términos relacionados con turismo");
-  allSignals.push(...patternAnalysis.signals);
 
-  // Level 2: Commercial inquiry?
-  const hasCommercialSignals = patternAnalysis.patterns.strongSignals.length > 0 || 
-                              patternAnalysis.patterns.moderateSignals.length >= 2;
-  
-  if (!hasCommercialSignals && patternAnalysis.patterns.negativeSignals.length > 0) {
-    reasoning.push("Detectadas señales negativas (newsletter, confirmación, etc.)");
-    return {
-      isTourismRelated: true,
-      isCommercialInquiry: false,
-      isQuoteRequest: false,
-      quoteType: "unclear",
-      finalConfidence: 15,
-      reasoning,
-      allSignals
-    };
-  }
+  // Determine if it's a commercial inquiry
+  const hasStrongSignals = patternAnalysis.patterns.strongSignals.length > 0;
+  const hasNegativeSignals = patternAnalysis.patterns.negativeSignals.length > 0;
+  const isCommercialInquiry = hasStrongSignals && !hasNegativeSignals;
 
-  const isCommercialInquiry = hasCommercialSignals;
-  if (isCommercialInquiry) {
-    reasoning.push("Tiene características de consulta comercial");
-  }
-
-  // Level 3: Quote request type
+  // Quick B2B detection
   const b2bAnalysis = detectB2BPatterns(subject, body, fromEmail);
   allSignals.push(...b2bAnalysis.indicators);
   
-  let quoteType: "B2B" | "B2C" | "unclear" = "unclear";
-  if (b2bAnalysis.isB2B) {
-    quoteType = "B2B";
-    reasoning.push(`Identificado como B2B (${b2bAnalysis.confidence}% confianza)`);
-  } else if (isCommercialInquiry) {
-    quoteType = "B2C";
-    reasoning.push("Identificado como B2C - consulta directa de cliente");
-  }
+  const quoteType: "B2B" | "B2C" | "unclear" = b2bAnalysis.isB2B ? "B2B" : 
+                                                isCommercialInquiry ? "B2C" : "unclear";
 
-  // Level 4: Final confidence calculation
-  let baseConfidence = patternAnalysis.score;
-  
-  // Boost for B2B with moderate patterns
-  if (b2bAnalysis.isB2B && patternAnalysis.score >= 40) {
-    baseConfidence += 20;
-    reasoning.push("Bonus B2B aplicado");
-  }
-  
-  // Boost for strong commercial signals
-  if (patternAnalysis.patterns.strongSignals.length >= 2) {
-    baseConfidence += 15;
-    reasoning.push("Bonus por múltiples señales fuertes");
-  }
+  // Simplified confidence calculation
+  let finalConfidence = patternAnalysis.score;
+  if (b2bAnalysis.isB2B && hasStrongSignals) finalConfidence += 20;
+  finalConfidence = Math.min(100, finalConfidence);
 
-  const isQuoteRequest = baseConfidence >= 50;
-  const finalConfidence = Math.min(100, baseConfidence);
-
-  if (isQuoteRequest) {
-    reasoning.push(`Clasificado como solicitud de cotización (${finalConfidence}% confianza)`);
-  } else {
-    reasoning.push(`No alcanza umbral para cotización (${finalConfidence}% < 50%)`);
-  }
+  const isQuoteRequest = finalConfidence >= 50;
 
   return {
     isTourismRelated,
@@ -260,7 +213,7 @@ export function classifyEmailMultiLevel(subject: string, body: string, fromEmail
     isQuoteRequest,
     quoteType,
     finalConfidence,
-    reasoning,
+    reasoning: [`Score: ${finalConfidence}`, `Type: ${quoteType}`],
     allSignals: [...new Set(allSignals)]
   };
 }
@@ -342,7 +295,7 @@ export function parseClassificationResponse(
       };
     }
   } catch (error) {
-    console.error("Error parsing classification response:", error);
+    // Silent error handling
   }
 
   // Fallback
