@@ -32,9 +32,36 @@ async function main() {
       process.exit(1);
     }
 
-    // Crear y ejecutar el agente (logging handled internally)
+    // Crear y ejecutar el agente con el nuevo método Map-Reduce mejorado
     const agent = new SimpleQuoteAgent(config);
-    await agent.processEmails();
+    const result = await agent.processEmailsMapReduce({
+      maxEmails: 50,
+      concurrency: 3,
+      retries: 2, // Reintentos por email
+      perEmail: {
+        recursionLimit: 50,
+        timeoutMs: 25000,
+      },
+    });
+
+    // Mostrar resumen final
+    console.log(`\n📊 RESUMEN FINAL:`);
+    console.log(`   📧 Total emails: ${result.summary.totalEmails}`);
+    console.log(`   ✅ Cotizaciones exitosas: ${result.summary.successfulQuotations}`);
+    console.log(`   ❌ Emails fallidos: ${result.summary.failedEmails}`);
+    console.log(`   📈 Tasa de éxito: ${result.metrics.successRate.toFixed(1)}%`);
+    console.log(`   ⏱️  Tiempo total: ${result.summary.processingTime}`);
+    console.log(`   ⚡ Promedio por email: ${Math.round(result.metrics.avgProcessingTimePerEmail)}ms`);
+    
+    if (result.metrics.errors.length > 0) {
+      console.log(`\n⚠️  ERRORES ENCONTRADOS (${result.metrics.errors.length}):`);
+      result.metrics.errors.slice(0, 5).forEach((error, idx) => {
+        console.log(`   ${idx + 1}. ${error.emailId}: ${error.error}`);
+      });
+      if (result.metrics.errors.length > 5) {
+        console.log(`   ... y ${result.metrics.errors.length - 5} errores más`);
+      }
+    }
 
   } catch (error) {
     console.error("❌ Error ejecutando agente:", error);
