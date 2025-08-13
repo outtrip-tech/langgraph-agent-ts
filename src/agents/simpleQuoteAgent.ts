@@ -74,6 +74,15 @@ const StateAnnotation = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => false,
   }),
+  // Anti-loop protection
+  iterationCount: Annotation<number>({
+    reducer: (x, y) => (y ?? x ?? 0) + 1,
+    default: () => 0,
+  }),
+  maxIterations: Annotation<number>({
+    reducer: (x, y) => y ?? x,
+    default: () => 100,
+  }),
 });
 
 export class SimpleQuoteAgent {
@@ -312,7 +321,7 @@ export class SimpleQuoteAgent {
       const existingQuotation = extractionResult.existingQuotation;
 
       // Crear cotización base con datos existentes y nuevos datos
-      const baseQuotation = {
+      let baseQuotation = {
         ...existingQuotation,
         // Solo actualizar campos que tienen nuevos valores
         ...(extractionResult.clientName && {
@@ -351,6 +360,9 @@ export class SimpleQuoteAgent {
         }),
         ...(extractionResult.budget && { budget: extractionResult.budget }),
       };
+
+      // Validar consistencia en el número de personas después de la actualización
+      baseQuotation = this.validateAndFixPersonCount(baseQuotation);
 
       // Re-validar campos faltantes con la cotización actualizada
       const missingFields = validateMissingFields(baseQuotation);
@@ -577,9 +589,18 @@ export class SimpleQuoteAgent {
     }
   }
 
-  // Node: Read emails
+  // Node: Read emails (with improved state management)
   private async leerEmails(state: any): Promise<any> {
     try {
+      // Anti-loop protection
+      if (state.iterationCount >= state.maxIterations) {
+        SimpleLogger.logError(
+          "Maximum iterations reached in leerEmails",
+          new Error("LOOP_PROTECTION")
+        );
+        return { finished: true, error: "Loop protection activated" };
+      }
+
       // If we have emails and haven't finished processing, get next email
       if (
         state.emails.length > 0 &&
@@ -592,8 +613,17 @@ export class SimpleQuoteAgent {
         };
       }
 
-      // First time or need to read new emails
+      // If we've processed all emails in the current batch, mark as finished
+      if (
+        state.emails.length > 0 &&
+        state.currentEmailIndex >= state.emails.length
+      ) {
+        return {
+          finished: true,
+        };
+      }
 
+      // First time or need to read new emails
       const result = await readEmailsTool.invoke({ maxResults: 5 });
 
       if (result.emails.length === 0) {
@@ -610,6 +640,7 @@ export class SimpleQuoteAgent {
         finished: false,
       };
     } catch (error) {
+      SimpleLogger.logError("Error in leerEmails", error as Error);
       return {
         error: `Error leyendo emails: ${error}`,
         finished: true,
@@ -850,6 +881,33 @@ export class SimpleQuoteAgent {
     }
   }
 
+  // Helper: Validate and fix person count inconsistencies
+  private validateAndFixPersonCount(quotation: any): any {
+    const numberOfPeople = quotation.numberOfPeople || 0;
+    const adults = quotation.adults || 0;
+    const children = quotation.children || 0;
+    
+    // If we have a breakdown that adds up correctly, keep it
+    if (adults > 0 || children > 0) {
+      const calculatedTotal = adults + children;
+      if (calculatedTotal === numberOfPeople) {
+        return quotation; // Already consistent
+      }
+      
+      // If total doesn't match breakdown, prefer breakdown if it makes sense
+      if (calculatedTotal > 0 && numberOfPeople === 0) {
+        return { ...quotation, numberOfPeople: calculatedTotal };
+      }
+      
+      // If breakdown is suspicious (like adults=0 but total > children), clear breakdown
+      if (adults === 0 && numberOfPeople > children && numberOfPeople > 1) {
+        return { ...quotation, adults: 0, children: 0 };
+      }
+    }
+    
+    return quotation;
+  }
+
   // Node: Create quotation
   private async generarCotizacion(state: any): Promise<any> {
     try {
@@ -873,7 +931,7 @@ export class SimpleQuoteAgent {
         currentEmail.from;
 
       // Create comprehensive quotation with all new fields
-      const quotationData = {
+      let quotationData = {
         isQuoteRequest: true as const,
         clientName: extractionResult.clientName || "Cliente",
         clientEmail: extractionResult.clientEmail || fromEmail,
@@ -908,6 +966,9 @@ export class SimpleQuoteAgent {
         createdAt: extractionResult.createdAt || new Date().toISOString(),
         emailHistory: extractionResult.emailHistory || [],
       };
+
+      // Validate and fix person count inconsistencies
+      quotationData = this.validateAndFixPersonCount(quotationData);
 
       const quotation = await SimpleDataManager.createQuotation(quotationData);
 
@@ -976,6 +1037,7 @@ export class SimpleQuoteAgent {
         esCotizacion: false, // Reset flag
         finished: !hasMoreEmails,
         error: undefined, // Clear any previous errors
+        iterationCount: 0, // Reset iteration counter for next email
       };
     } catch (error) {
       return {
@@ -990,67 +1052,182 @@ export class SimpleQuoteAgent {
     return { finished: true };
   }
 
-  // Routing functions (optimized for smart routing)
-  private decidirDespuesLeerEmails(state: any): string {
-    // Fast path for completion
-    if (state.finished || state.error || !state.currentEmail) {
-      return "finalizar";
+  // Routing debugging helper
+  private makeRoutingDecision(
+    fromNode: string,
+    state: any,
+    decisionLogic: () => string
+  ): string {
+    // Initialize routing path if not exists
+    if (!state.routingPath) {
+      state.routingPath = [];
     }
 
-    // Check if we need to verify follow-up first
-    return "verificarSeguimiento";
+    // Increment iteration counter on each routing decision
+    if (state.iterationCount === undefined) {
+      state.iterationCount = 0;
+    }
+    state.iterationCount++;
+
+    const decision = decisionLogic();
+    const routingInfo = {
+      from: fromNode,
+      to: decision,
+      iteration: state.iterationCount,
+      emailIndex: state.currentEmailIndex || 0,
+      timestamp: new Date().toISOString(),
+      stateKeys: Object.keys(state).filter(
+        (key) => !key.startsWith("routingPath")
+      ),
+    };
+
+    state.routingPath.push(routingInfo);
+
+    // Detect potential loops by checking recent routing history
+    if (state.routingPath.length > 5) {
+      const recent = state.routingPath.slice(-5);
+      const pathString = recent.map((r: any) => `${r.from}→${r.to}`).join("|");
+      console.log(`🔄 Recent path: ${pathString}`);
+
+      // Check for obvious loops - same transition repeating
+      const transitions = recent.map((r: any) => `${r.from}→${r.to}`);
+      const transitionCounts = transitions.reduce((acc: any, t: string) => {
+        acc[t] = (acc[t] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      const repeatedTransitions = Object.entries(transitionCounts).filter(
+        ([_, count]) => (count as number) > 1
+      );
+
+      if (repeatedTransitions.length > 0) {
+        console.warn(
+          `⚠️  LOOP DETECTED: Repeated transitions: ${repeatedTransitions
+            .map(([t, c]) => `${t}(x${c})`)
+            .join(", ")}`
+        );
+      }
+    }
+
+    return decision;
+  }
+
+  // Routing functions (optimized for smart routing)
+  private decidirDespuesLeerEmails(state: any): string {
+    const decision = this.makeRoutingDecision("leerEmails", state, () => {
+      // Anti-loop protection
+      if (state.iterationCount >= state.maxIterations) {
+        SimpleLogger.logError(
+          "Maximum iterations reached - forcing termination",
+          new Error("LOOP_PROTECTION")
+        );
+        return "finalizar";
+      }
+
+      // Fast path for completion
+      if (state.finished || state.error || !state.currentEmail) {
+        return "finalizar";
+      }
+
+      // Check if we need to verify follow-up first
+      return "verificarSeguimiento";
+    });
+    return decision;
   }
 
   private decidirDespuesVerificarSeguimiento(state: any): string {
-    if (state.error) {
-      return "clasificar"; // Continue with normal flow if verification fails
-    }
+    const decision = this.makeRoutingDecision(
+      "verificarSeguimiento",
+      state,
+      () => {
+        if (state.error) {
+          return "clasificar"; // Continue with normal flow if verification fails
+        }
 
-    if (state.isFollowUpResponse) {
-      return "procesarRespuesta";
-    }
+        if (state.isFollowUpResponse) {
+          return "procesarRespuesta";
+        }
 
-    return "clasificar";
+        return "clasificar";
+      }
+    );
+    return decision;
   }
 
   private decidirDespuesVerificarCompletitud(state: any): string {
-    if (state.error || !state.completenessEvaluation) {
-      return "procesar"; // Skip email sending if evaluation fails
-    }
+    const decision = this.makeRoutingDecision(
+      "verificarCompletitud",
+      state,
+      () => {
+        if (state.error || !state.completenessEvaluation) {
+          return "procesar"; // Skip email sending if evaluation fails
+        }
 
-    const { completenessEvaluation } = state;
+        const { completenessEvaluation } = state;
 
-    switch (completenessEvaluation.recommendation) {
-      case "complete":
-        return "notificar";
-      case "request_more_info":
-        return "solicitar";
-      case "proceed_with_partial":
-      default:
-        return "procesar";
-    }
+        switch (completenessEvaluation.recommendation) {
+          case "complete":
+            return "notificar";
+          case "request_more_info":
+            return "solicitar";
+          case "proceed_with_partial":
+          default:
+            return "procesar";
+        }
+      }
+    );
+    return decision;
   }
 
   private decidirDespuesClasificar(state: any): string {
-    // Smart routing - avoid unnecessary processing
-    if (state.error) {
-      return "procesar"; // Process with error to mark as read
-    }
+    const decision = this.makeRoutingDecision("clasificar", state, () => {
+      // Smart routing - avoid unnecessary processing
+      if (state.error) {
+        return "procesar"; // Process with error to mark as read
+      }
 
-    // Early exit for non-quotes
-    if (!state.esCotizacion) {
-      return "procesar"; // Skip extraction, go straight to processing
-    }
+      // Early exit for non-quotes
+      if (!state.esCotizacion) {
+        return "procesar"; // Skip extraction, go straight to processing
+      }
 
-    return "extraer";
+      return "extraer";
+    });
+    return decision;
   }
 
   private decidirDespuesProcesar(state: any): string {
-    // Early termination conditions
-    if (state.finished || state.error) {
-      return "finalizar";
-    }
-    return "continuar"; // Continue with next email
+    const decision = this.makeRoutingDecision("procesar", state, () => {
+      // Anti-loop protection
+      if (state.iterationCount >= state.maxIterations) {
+        SimpleLogger.logError(
+          "Maximum iterations reached in process decision",
+          new Error("LOOP_PROTECTION")
+        );
+        return "finalizar";
+      }
+
+      // Early termination conditions
+      if (state.finished || state.error) {
+        return "finalizar";
+      }
+
+      // Critical fix: Check if we've processed all emails
+      const emailsLength = state.emails ? state.emails.length : 0;
+      const currentIndex = state.currentEmailIndex || 0;
+
+      if (currentIndex >= emailsLength) {
+        console.log(
+          `✅ All emails processed (${currentIndex}/${emailsLength}) - finalizing`
+        );
+        return "finalizar";
+      }
+
+      console.log(
+        `📧 Continuing to next email (${currentIndex + 1}/${emailsLength})`
+      );
+      return "continuar"; // Continue with next email
+    });
+    return decision;
   }
 
   // Main processing method - maintains same API as before
@@ -1065,12 +1242,16 @@ export class SimpleQuoteAgent {
         currentEmailIndex: 0,
         processedQuotations: [],
         finished: false,
+        iterationCount: 0,
+        maxIterations: 10, // Safety limit per email batch
       };
 
       const startTime = Date.now();
 
       // Run the graph
-      const result = await this.graph.invoke(initialState);
+      const result = await this.graph.invoke(initialState, {
+        recursionLimit: 150,
+      });
 
       const processedQuotations = result.processedQuotations || [];
       const processingTimeMs = Date.now() - startTime;

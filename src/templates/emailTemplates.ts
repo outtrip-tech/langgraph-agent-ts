@@ -24,12 +24,13 @@ const DMC_CONFIG = {
 // Mapeo de campos faltantes a descripciones humanas
 const FIELD_DESCRIPTIONS: Record<string, string> = {
   clientEmail: "dirección de email de contacto",
+  destination: "destino del viaje",
   startDate: "fecha de inicio del viaje", 
   endDate: "fecha de finalización del viaje",
-  numberOfPeople: "número total de personas",
-  adults: "número de adultos",
-  children: "número de niños",
-  childrenAges: "edades de los niños",
+  numberOfPeople: "número total de personas que viajan (incluyendo adultos y niños)",
+  adults: "número de adultos que viajan (mayores de 12 años)",
+  children: "número de niños que viajan (menores de 12 años)",
+  childrenAges: "edades específicas de los niños",
   city: "ciudad específica de destino",
   country: "país de destino",
   interests: "actividades o experiencias de interés",
@@ -51,25 +52,108 @@ export class EmailTemplateGenerator {
     const clientName = quotation.clientName || "Estimado/a viajero/a";
     const destination = quotation.destination || "su destino";
     
-    // Convertir campos faltantes a descripciones humanas
-    const missingDescriptions = quotation.missingFields
-      .map(field => FIELD_DESCRIPTIONS[field] || field)
-      .filter(desc => desc); // Filtrar campos no mapeados
+    // Campos esenciales (obligatorios)
+    const essentialFields = quotation.missingFields.filter(field => 
+      ['destination', 'startDate', 'endDate', 'numberOfPeople', 'adults', 'children'].includes(field)
+    );
 
-    // Crear lista de datos faltantes
-    const missingList = missingDescriptions
-      .map(desc => `• ${desc.charAt(0).toUpperCase() + desc.slice(1)}`)
+    // Función auxiliar para generar solicitudes específicas de personas
+    const generatePersonCountRequest = (missing: string[]) => {
+      const needsTotalPeople = missing.includes('numberOfPeople');
+      const needsAdults = missing.includes('adults');
+      const needsChildren = missing.includes('children');
+
+      if (needsTotalPeople || needsAdults || needsChildren) {
+        let personText = "Para confirmar el número de viajeros, necesitamos saber:\n";
+        
+        if (needsTotalPeople) {
+          personText += `- ${FIELD_DESCRIPTIONS['numberOfPeople']}\n`;
+        }
+        if (needsAdults) {
+          personText += `- ${FIELD_DESCRIPTIONS['adults']}\n`;
+        }
+        if (needsChildren) {
+          personText += `- ${FIELD_DESCRIPTIONS['children']}\n`;
+        }
+        
+        personText += "\nEjemplo: 'Viajan 2 adultos y 1 niño de 8 años' o 'Somos 4 adultos en total'";
+        return personText;
+      }
+      return null;
+    };
+
+    const personCountRequest = generatePersonCountRequest(quotation.missingFields);
+
+    // Campos adicionales útiles que vale la pena preguntar
+    const additionalUsefulFields = [];
+    if (!quotation.interests || quotation.interests.length === 0) {
+      additionalUsefulFields.push('interests');
+    }
+    if (!quotation.budget.amount) {
+      additionalUsefulFields.push('budget.amount');
+    }
+    if (quotation.children > 0 && (!quotation.childrenAges || quotation.childrenAges.length === 0)) {
+      additionalUsefulFields.push('childrenAges');
+    }
+    if (!quotation.dietaryRequirements.restrictions || quotation.dietaryRequirements.restrictions.length === 0) {
+      additionalUsefulFields.push('dietaryRequirements.restrictions');
+    }
+
+    // Filtrar campos relacionados con personas para manejo especial
+    const personRelatedFields = ['numberOfPeople', 'adults', 'children'];
+    const nonPersonEssentialFields = essentialFields.filter(field => 
+      !personRelatedFields.includes(field)
+    );
+
+    // Crear secciones separadas para campos esenciales y adicionales
+    const essentialList = nonPersonEssentialFields
+      .map(field => FIELD_DESCRIPTIONS[field] || field)
+      .filter(desc => desc)
+      .map(desc => `- ${desc.charAt(0).toUpperCase() + desc.slice(1)}`)
       .join('\n');
+
+    const additionalList = additionalUsefulFields
+      .map(field => FIELD_DESCRIPTIONS[field] || field)
+      .filter(desc => desc)
+      .map(desc => `- ${desc.charAt(0).toUpperCase() + desc.slice(1)}`)
+      .join('\n');
+
+    // Construir el contenido del email con secciones organizadas
+    let informationSection = '';
+    
+    if (essentialList || personCountRequest) {
+      informationSection += `INFORMACION ESENCIAL:\n`;
+      if (personCountRequest) {
+        informationSection += `${personCountRequest}\n`;
+        if (essentialList) informationSection += '\n';
+      }
+      if (essentialList) {
+        informationSection += `${essentialList}\n`;
+      }
+    }
+    
+    if (additionalList) {
+      informationSection += `\nINFORMACION ADICIONAL que nos ayudaría a personalizar mejor su experiencia:\n${additionalList}\n`;
+    }
+
+    // Si no hay campos esenciales faltantes, solo pedir información adicional
+    if (!informationSection.includes('INFORMACION ESENCIAL:') && additionalList) {
+      informationSection = `Para ofrecerle la mejor propuesta personalizada, nos sería muy útil conocer:\n\n${additionalList}\n`;
+    }
 
     const body = `${clientName},
 
-Muchas gracias por contactarnos para su solicitud de viaje a ${destination}. 
+Muchas gracias por contactarnos para su solicitud de viaje a ${destination}.
 
-Estamos encantados de poder asistirle con su cotización personalizada. Para ofrecerle la mejor propuesta adaptada a sus necesidades, necesitaríamos algunos datos adicionales:
+Estamos encantados de poder asistirle con su cotización personalizada.
+Para ofrecerle la mejor propuesta adaptada a sus necesidades,
+necesitaríamos algunos datos adicionales:
 
-${missingList}
+${informationSection}
 
-Una vez que recibamos esta información, nuestro equipo estará en condiciones de enviarle una cotización detallada y personalizada en un plazo máximo de 24 horas.
+Una vez que recibamos esta información, nuestro equipo estará en
+condiciones de enviarle una cotización detallada y personalizada en un
+plazo máximo de 24 horas.
 
 Le agradecemos su confianza y quedamos atentos a su respuesta.
 
@@ -78,8 +162,7 @@ Saludos cordiales,
 ${DMC_CONFIG.signature}
 ${DMC_CONFIG.name}${DMC_CONFIG.phone ? `\nTeléfono: ${DMC_CONFIG.phone}` : ''}${DMC_CONFIG.website ? `\nWeb: ${DMC_CONFIG.website}` : ''}
 
----
-Ref: ${quotation.id}`;
+`;
 
     return {
       subject: `Re: ${emailOriginal.subject} - Información adicional requerida`,
@@ -132,8 +215,7 @@ Saludos cordiales,
 ${DMC_CONFIG.signature}
 ${DMC_CONFIG.name}${DMC_CONFIG.phone ? `\nTeléfono: ${DMC_CONFIG.phone}` : ''}${DMC_CONFIG.website ? `\nWeb: ${DMC_CONFIG.website}` : ''}
 
----
-Ref: ${quotation.id}`;
+`;
 
     return {
       subject: `Re: ${emailOriginal.subject} - Cotización en proceso`,
@@ -170,8 +252,7 @@ Saludos cordiales,
 ${DMC_CONFIG.signature}
 ${DMC_CONFIG.name}
 
----
-Ref: ${quotation.id}`;
+`;
 
     return {
       subject: `Seguimiento: Su cotización para ${destination} - ${quotation.id}`,

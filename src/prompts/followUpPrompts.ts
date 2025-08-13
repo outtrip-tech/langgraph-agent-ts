@@ -34,6 +34,8 @@ Devuelve un JSON con SOLO los campos que se pueden actualizar basándose en la i
     // Solo incluir campos que se pueden actualizar con información del email
     "startDate": "DD/MM/YYYY", // solo si se menciona fecha específica
     "endDate": "DD/MM/YYYY",   // solo si se menciona fecha específica
+    "flexDates": boolean,       // true si solo menciona mes sin fechas específicas
+    "preferredMonth": "string", // nombre del mes si fechas son flexibles
     "numberOfPeople": number,   // solo si se menciona número específico
     "adults": number,           // solo si se especifica
     "children": number,         // solo si se especifica
@@ -61,9 +63,20 @@ Devuelve un JSON con SOLO los campos que se pueden actualizar basándose en la i
 1. Solo extraer información EXPLÍCITA del email
 2. No inventar datos
 3. Ser conservador - es mejor no extraer que extraer incorrectamente
-4. Fechas solo en formato DD/MM/YYYY si están claramente especificadas
-5. Números solo si son exactos y claros
-6. Normalizar intereses y preferencias alimentarias en minúsculas y sin tildes`;
+4. **Fechas específicas**: en formato DD/MM/YYYY solo si están claramente especificadas
+5. **Fechas flexibles**: Si solo menciona un mes → configurar flexDates=true y preferredMonth="mes"
+6. Números solo si son exactos y claros
+7. Normalizar intereses y preferencias alimentarias en minúsculas y sin tildes
+
+## Reglas especiales para número de personas:
+8. **Interpretar con cuidado "personas" en español**:
+   - "4 personas y 1 niño" = 4 adultos + 1 niño (total 5)
+   - "5 personas total" = numberOfPeople: 5 (dejar adults/children vacío si no se especifica)
+   - "viajan 3 adultos" = adults: 3, numberOfPeople: 3
+   - "somos una familia de 4" = numberOfPeople: 4 (dejar adults/children vacío)
+9. **Solo extraer adults/children si está CLARAMENTE separado**
+10. **Si la información es ambigua sobre adults/children, dejar esos campos vacíos**
+11. **Validar que numberOfPeople = adults + children cuando ambos están presentes**`;
 }
 
 export function parseFollowUpExtractionResponse(response: string): {
