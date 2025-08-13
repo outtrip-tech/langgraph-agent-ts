@@ -32,9 +32,16 @@ async function main() {
       process.exit(1);
     }
 
-    // Crear y ejecutar el agente (logging handled internally)
+    // Crear y ejecutar el agente con el nuevo método Map-Reduce
     const agent = new SimpleQuoteAgent(config);
-    await agent.processEmails();
+    await agent.processEmailsMapReduce({
+      maxEmails: 50,
+      concurrency: 3,
+      perEmail: {
+        recursionLimit: 50,
+        timeoutMs: 25000,
+      },
+    });
 
   } catch (error) {
     console.error("❌ Error ejecutando agente:", error);
