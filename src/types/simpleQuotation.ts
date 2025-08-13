@@ -150,3 +150,40 @@ export interface ClassificationResult {
   confidence: number;
   quote_type?: "B2B" | "B2C" | "unclear" | null;
 }
+
+// Processing metrics and results
+export interface ProcessingMetrics {
+  emailsProcessed: number;
+  quotationsCreated: number;
+  notQuotations: number;
+  processingTimeMs: number;
+  avgProcessingTimePerEmail: number;
+  successRate: number;
+  errors: Array<{
+    emailId: string;
+    error: string;
+    timestamp: string;
+  }>;
+}
+
+export interface BatchProcessingResult {
+  quotations: SimpleQuotation[];
+  metrics: ProcessingMetrics;
+  summary: {
+    totalEmails: number;
+    successfulQuotations: number;
+    failedEmails: number;
+    processingTime: string;
+  };
+}
+
+// Configuration interfaces
+export interface EmailProcessingConfig {
+  maxEmails?: number;
+  concurrency?: number;
+  retries?: number;
+  perEmail?: {
+    recursionLimit?: number;
+    timeoutMs?: number;
+  };
+}
